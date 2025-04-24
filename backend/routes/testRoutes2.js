@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const TestResult = require('../models/TestResult');
+const fs = require('fs');
+const path = require('path');
+// Load real users data
+const users = JSON.parse(fs.readFileSync(path.join(__dirname, '../users.json')));
 
 const VALID_TEST_TYPES = [
   'smoke',
@@ -232,30 +236,70 @@ async function startTest(testType, url, vus, duration, io) {
 
     case 'stress':
       interval = setInterval(async () => {
-        currentVUs = Math.min(currentVUs + Math.ceil(maxVUs * 0.1), maxVUs * 2);
-        const stressLevel = currentVUs / maxVUs;
-        const baseLatency = 100;
-        const stressImpact = Math.pow(stressLevel, 2) * 200;
-        const randomVariation = Math.random() * 50;
-        
-        const testData = {
-          timestamp: new Date().toISOString(),
-          responseTime: baseLatency + stressImpact + randomVariation,
-          status: stressLevel > 1.5 ? 503 : 200,
-          activeVUs: currentVUs,
-          testType: 'stress',
-          url: url,
-          vus: maxVUs,
-          duration: duration
-        };
-
         try {
+          currentVUs = Math.min(currentVUs + Math.ceil(maxVUs * 0.1), maxVUs);
+          
+          // Get subset of real users based on current VUs
+          const activeUsers = users.slice(0, currentVUs);
+          
+          const startTime = Date.now();
+          const requests = activeUsers.map(async (user) => {
+            try {
+              // Login with real user
+              const loginResponse = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  username: user.username,
+                  password: user.password
+                })
+              });
+
+              if (!loginResponse.ok) {
+                return { error: 'Login failed' };
+              }
+
+              const { token } = await loginResponse.json();
+
+              // Access the target URL with auth token
+              return fetch(url, {
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'User-Agent': `Load-Test-${user.username}`
+                }
+              });
+            } catch (error) {
+              return { error };
+            }
+          });
+          
+          const responses = await Promise.all(requests);
+          const endTime = Date.now();
+          
+          const errors = responses.filter(r => r.error || (r.status && r.status >= 400)).length;
+          const avgResponseTime = endTime - startTime;
+          
+          const testData = {
+            timestamp: new Date().toISOString(),
+            responseTime: avgResponseTime,
+            status: errors > (currentVUs / 2) ? 503 : 200,
+            activeVUs: currentVUs,
+            testType: 'stress',
+            errorRate: (errors / currentVUs) * 100,
+            url: url,
+            vus: maxVUs,
+            duration: duration,
+            realUsers: true
+          };
+
           const testResult = new TestResult(testData);
           await testResult.save();
           io.emit('testUpdate', testData);
-          console.log('Stress test data saved:', testData);
+          
         } catch (error) {
-          console.error('Error in stress test:', error);
+          console.error('Stress test error:', error);
         }
       }, 1000);
       return interval;
